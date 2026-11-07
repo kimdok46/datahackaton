@@ -4,7 +4,9 @@ from pathlib import Path
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
-from backend import db
+import time
+
+from backend import ai, db, scoring
 
 ROOT = Path(__file__).resolve().parent.parent
 app = FastAPI()
@@ -72,6 +74,38 @@ def put_checklist(data: dict = Body(...)):
             raise HTTPException(400, f"Вес критерия {c['id']} не может быть отрицательным")
     return {"version": db.save_checklist(data)}
 
+def evaluate_and_save(conv_id):
+    conv = db.get_conversation(conv_id)
+    if conv is None:
+        raise HTTPException(404, "Диалог не найден")
+    checklist = db.get_checklist()
+    ai_result = ai.evaluate(conv, checklist)
+    calc = scoring.compute_total(checklist, ai_result["answers"])
+    final = {"criteria": ai_result["criteria"], **calc}
+    db.save_evaluation(conv_id, checklist["version"], ai_result, final,
+                       calc["total"], calc["gross_error"])
+    return db.get_evaluation(conv_id)
 
+
+@app.post("/api/conversations/{conv_id}/evaluate")
+def evaluate_one(conv_id: str):
+    try:
+        return evaluate_and_save(conv_id)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+
+
+@app.post("/api/evaluate-all")
+def evaluate_all():
+    ok, failed = 0, []
+    for c in db.list_conversations():
+        try:
+            evaluate_and_save(c["id"])
+            ok += 1
+        except Exception as e:
+            failed.append({"id": c["id"], "error": str(e)})
+        time.sleep(1)  # пауза, чтобы не упереться в лимит запросов в минуту
+    return {"evaluated": ok, "failed": failed}
+    
 # Раздача страницы. Эта строка должна быть ПОСЛЕДНЕЙ в файле.
 app.mount("/", StaticFiles(directory=ROOT / "frontend", html=True), name="frontend")

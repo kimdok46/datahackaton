@@ -1,3 +1,5 @@
-   fastapi
-   uvicorn
-   requests
+fastapi
+uvicorn
+requests
+openai
+python-dotenv

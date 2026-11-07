@@ -77,6 +77,11 @@ input,select,textarea {width:100%;border:1px solid var(--border);border-radius:8
 .main {padding:15px}.stats {grid-template-columns:1fr}.workspace {grid-template-columns:1fr}
 .conversation-list {max-height:300px}.chat-body {height:450px}
 }
+.eval-btn{width:100%;padding:12px;margin:10px 0 4px;border:0;border-radius:10px;background:#20a66a;color:#fff;font-size:14px;font-weight:bold;cursor:pointer}
+.eval-btn:disabled{opacity:.6;cursor:wait}
+.explain{margin-top:8px;padding:9px;border-radius:8px;background:#f1f7f3;font-size:12px;line-height:1.45}
+.ev-link{display:block;margin-top:5px;color:#16804b;cursor:pointer;text-decoration:underline}
+.message.flash{outline:3px solid #f5c542;transition:outline .3s}
 </style>
 </head>
 <body>
@@ -129,6 +134,8 @@ input,select,textarea {width:100%;border:1px solid var(--border);border-radius:8
 <aside class="right">
 <h2>Оценка качества</h2>
 <div class="right-sub">Чек-лист оценки работы оператора</div>
+<button id="evalBtn" class="eval-btn" onclick="runEvaluation()">Оценить с помощью ИИ</button>
+<div id="evalStatus" class="hint"></div>
 <div id="scoreSummary" class="score-card">
 <div class="score-caption">ИТОГОВАЯ ОЦЕНКА</div>
 <div class="score-number">— / 100</div>
@@ -147,6 +154,7 @@ let checklistData = null;
 let selectedId = null;
 let answers = {};
 let reasons = {};
+let evals = {};
 
 async function api(path) {
   const response = await fetch(API + path);
@@ -250,24 +258,71 @@ async function openConversation(id) {
     document.getElementById("chatMeta").textContent =
       `${conversation.language || ""} · ${conversation.channel || ""} · ${messages.length} сообщений`;
 
-    document.getElementById("chatBody").innerHTML = messages.map(m => {
+    document.getElementById("chatBody").innerHTML = messages.map((m, i) => {
       const speaker = String(m.speaker || "system").toLowerCase();
       const type = ["client","operator","bot","system"].includes(speaker)
         ? speaker : "system";
 
-      return `<div class="message ${type}">
+      return `<div class="message ${type}" id="msg-${i}">
         <div class="msg-head">${escapeHtml(m.speaker)} · ${escapeHtml(m.timestamp)}</div>
         ${escapeHtml(m.text)}
       </div>`;
     }).join("") || '<div class="empty">Сообщений нет</div>';
 
     document.getElementById("chatBody").scrollTop = 0;
+
+    if (conversation.evaluation) {
+      applyEvaluation(id, conversation.evaluation);
+      renderChecklist();
+      calculateScore();
+    }
   } catch (error) {
     if (selectedId !== id) return;
     document.getElementById("chatBody").innerHTML =
       '<div class="error">Не удалось открыть диалог: ' +
       escapeHtml(error.message) + '</div>';
   }
+}
+
+function applyEvaluation(id, ev) {
+  if (!ev || !ev.final) return;
+  evals[id] = {};
+  answers[id] = {};
+  reasons[id] = reasons[id] || {};
+  ev.final.criteria.forEach(c => {
+    evals[id][c.criterion_id] = c;
+    answers[id][c.criterion_id] = String(c.answer);
+    if (c.answer === "yes") reasons[id][c.criterion_id] = c.explanation;
+  });
+}
+
+async function runEvaluation() {
+  if (!selectedId) { alert("Сначала выбери диалог."); return; }
+  const id = selectedId;
+  const btn = document.getElementById("evalBtn");
+  const st = document.getElementById("evalStatus");
+  btn.disabled = true;
+  st.textContent = "ИИ оценивает диалог, подожди 10-30 секунд...";
+  try {
+    const r = await fetch(API + "/conversations/" + encodeURIComponent(id) + "/evaluate", { method: "POST" });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || ("Ошибка " + r.status));
+    applyEvaluation(id, data);
+    st.textContent = "Готово. Итог по расчёту сервера: " + data.total;
+    if (selectedId === id) { renderChecklist(); calculateScore(); }
+  } catch (e) {
+    st.textContent = "Ошибка: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function goToMessage(i) {
+  const el = document.getElementById("msg-" + i);
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.classList.add("flash");
+  setTimeout(() => el.classList.remove("flash"), 2500);
 }
 
 function renderChecklist() {
@@ -280,173 +335,4 @@ function renderChecklist() {
   );
 
   let html = "";
-  let lastSection = null;
-
-  criteria.forEach(c => {
-    const section = c.section || c.section_id || "";
-    const type = c.type || c.answer_type || "yes_no";
-
-    if (section !== lastSection) {
-      html += `<div class="section-title">${escapeHtml(sectionNames[section] || section)}</div>`;
-      lastSection = section;
-    }
-
-    let options = [];
-    if (type === "yes_no") {
-      options = [["yes","Да"],["no","Нет"]];
-      if (c.allow_na) options.push(["na","Неприменимо"]);
-    } else if (type === "scale") {
-      options = (c.scale || c.values || []).map(v => {
-        if (typeof v === "object") {
-          return [String(v.value ?? v.score), String(v.label ?? v.value)];
-        }
-        return [String(v), String(v)];
-      });
-      if (c.allow_na) options.push(["na","Неприменимо"]);
-    } else if (type === "flag") {
-      options = [["yes","Да — нарушение найдено"],["no","Нет — нарушения нет"]];
-    }
-
-    const saved = currentAnswers()[c.id] || "";
-    const optionHtml = options.map(([value,label]) =>
-      `<option value="${escapeHtml(value)}" ${saved === value ? "selected" : ""}>${escapeHtml(label)}</option>`
-    ).join("");
-
-    const reason = reasons[selectedId]?.[c.id] || "";
-    const reasonHtml = type === "flag" && saved === "yes" ? `
-      <div class="reason-input">
-        <label>Укажи причину критического нарушения *</label>
-        <textarea rows="2" data-reason="${escapeHtml(c.id)}"
-          placeholder="Опиши, какое нарушение обнаружено...">${escapeHtml(reason)}</textarea>
-      </div>` : "";
-
-    html += `<div class="criterion">
-      <div class="criterion-title">${escapeHtml(c.title || c.name || c.id)}</div>
-      <div class="criterion-desc">${escapeHtml(c.description || c.rule || "")}</div>
-      <div class="criterion-desc">Вес: ${escapeHtml(c.weight ?? 0)}</div>
-      <select data-criterion="${escapeHtml(c.id)}">
-        <option value="">Выбери оценку</option>${optionHtml}
-      </select>
-      ${reasonHtml}
-    </div>`;
-  });
-
-  document.getElementById("checklist").innerHTML =
-    html || '<div class="empty">Критерии не найдены</div>';
-
-  document.querySelectorAll("[data-criterion]").forEach(select => {
-    select.addEventListener("change", () => {
-      if (!selectedId) {
-        alert("Сначала выбери диалог.");
-        select.value = "";
-        return;
-      }
-      const id = select.dataset.criterion;
-      answers[selectedId] = answers[selectedId] || {};
-      answers[selectedId][id] = select.value;
-      renderChecklist();
-      calculateScore();
-    });
-  });
-
-  document.querySelectorAll("[data-reason]").forEach(input => {
-    input.addEventListener("input", () => {
-      if (!selectedId) return;
-      const id = input.dataset.reason;
-      reasons[selectedId] = reasons[selectedId] || {};
-      reasons[selectedId][id] = input.value;
-      calculateScore();
-    });
-  });
-}
-
-function calculateScore() {
-  const summary = document.getElementById("scoreSummary");
-  if (!summary) return;
-
-  if (!selectedId || !checklistData) {
-    summary.innerHTML = `
-      <div class="score-caption">ИТОГОВАЯ ОЦЕНКА</div>
-      <div class="score-number">— / 100</div>
-      <div class="score-caption">Выбери диалог для начала оценки</div>`;
-    return;
-  }
-
-  const criteria = checklistData.criteria || [];
-  const a = currentAnswers();
-
-  let earned = 0;
-  let possible = 0;
-  let completed = 0;
-  let totalApplicable = 0;
-  let grossCriterion = null;
-
-  criteria.forEach(c => {
-    const type = c.type || c.answer_type || "yes_no";
-    const answer = a[c.id];
-    if (type === "flag") {
-      grossCriterion = c;
-      if (answer !== undefined && answer !== "") completed++;
-      return;
-    }
-
-    totalApplicable++;
-    if (answer === undefined || answer === "") return;
-    completed++;
-
-    if (answer === "na") return;
-
-    const weight = Number(c.weight || 0);
-    possible += weight;
-
-    if (type === "yes_no") {
-      if (answer === "yes") earned += weight;
-    } else if (type === "scale") {
-      const values = (c.scale || c.values || []).map(v =>
-        Number(typeof v === "object" ? (v.value ?? v.score) : v)
-      ).filter(Number.isFinite);
-      const maxValue = Math.max(0, ...values);
-      const selectedValue = Number(answer);
-      if (maxValue > 0 && Number.isFinite(selectedValue)) {
-        earned += (selectedValue / maxValue) * weight;
-      }
-    }
-  });
-
-  const grossAnswer = grossCriterion ? a[grossCriterion.id] : undefined;
-  const critical = grossAnswer === "yes";
-  const reason = grossCriterion
-    ? (reasons[selectedId]?.[grossCriterion.id] || "").trim() : "";
-
-  const score = possible > 0 ? (earned / possible) * 100 : 0;
-  const preliminary = completed < criteria.length;
-
-  let statusHtml = "";
-  if (critical) {
-    statusHtml = `<div class="score-status critical">
-      КРИТИЧЕСКОЕ НАРУШЕНИЕ<br>
-      ${reason ? escapeHtml(reason) : "Укажи причину нарушения в чек-листе."}
-    </div>`;
-  } else if (grossAnswer === undefined || grossAnswer === "") {
-    statusHtml = '<div class="score-status warning">Необходимо проверить раздел «Грубые нарушения»</div>';
-  } else {
-    statusHtml = '<div class="score-status">Критических нарушений не обнаружено</div>';
-  }
-
-  summary.innerHTML = `
-    <div class="score-caption">${preliminary ? "ПРЕДВАРИТЕЛЬНАЯ ОЦЕНКА" : "ИТОГОВАЯ ОЦЕНКА"}</div>
-    <div class="score-number">${score.toFixed(2)} <span style="font-size:15px;color:#82918a">/ 100</span></div>
-    <div class="score-caption">Набрано ${earned.toFixed(2)} из ${possible.toFixed(2)} доступных баллов</div>
-    <div class="score-caption">Заполнено критериев: ${completed} из ${criteria.length}</div>
-    ${statusHtml}`;
-}
-
-["search","language","channel"].forEach(id => {
-  document.getElementById(id).addEventListener("input", renderConversations);
-  document.getElementById(id).addEventListener("change", renderConversations);
-});
-
-loadData();
-</script>
-</body>
-</html>
+  let lastSection =

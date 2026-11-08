@@ -36,12 +36,39 @@ def health():
 
 
 @app.post("/api/import")
-def import_dataset(group_id: str = "DEV"):
-    # Пока читаем локальный файл для DEV. Загрузку по ссылке организаторов добавим позже.
-    if group_id != "DEV":
-        raise HTTPException(400, "Загрузка по ссылке организаторов ещё не подключена")
-    data = json.loads((ROOT / "data" / "dev.json").read_text(encoding="utf-8"))
-    return {"imported": db.import_records(data["data"]["records"])}
+def import_dataset(group_id: str = "DEV", data: dict | None = Body(None)):
+    """
+    Без тела: загружает локальный data/dev.json (DEV).
+    С телом {"url": "<ссылка GET от организаторов>"}: сервер сам скачивает набор
+    (так нет проблем с CORS), сохраняет его в data/prod.json и добавляет диалоги в базу.
+    """
+    url = (data or {}).get("url")
+    if not url:
+        if group_id != "DEV":
+            raise HTTPException(400, "Для не-DEV набора передайте тело {\"url\": \"ссылка GET\"}")
+        dev = json.loads((ROOT / "data" / "dev.json").read_text(encoding="utf-8"))
+        return {"imported": db.import_records(dev["data"]["records"])}
+
+    try:
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as e:
+        raise HTTPException(502, f"Не удалось загрузить набор: {e}")
+    if not payload.get("isSuccess"):
+        raise HTTPException(502, f"API организаторов вернуло ошибку: {payload.get('error')}")
+    records = (payload.get("data") or {}).get("records") or []
+    if not records:
+        raise HTTPException(400, "В ответе нет записей (data.records пуст)")
+    ids = [x["conversation_id"] for x in records]
+    if len(ids) != len(set(ids)):
+        raise HTTPException(400, "В наборе есть повторяющиеся conversation_id")
+
+    group = str((payload["data"].get("dataset_group_id") or group_id))
+    if group.upper() != "DEV":
+        (ROOT / "data" / "prod.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {"imported": db.import_records(records), "group": group, "ids": ids}
 
 
 @app.get("/api/conversations")
@@ -220,8 +247,13 @@ def _start_job(ids):
 
 
 @app.post("/api/evaluate-all")
-def evaluate_all(only_missing: bool = False):
+def evaluate_all(only_missing: bool = False, data: dict | None = Body(None)):
     convs = db.list_conversations()
+    wanted = (data or {}).get("ids")
+    if wanted:  # оценить только указанные диалоги (например, контрольные)
+        convs = [c for c in convs if c["id"] in wanted]
+        if not convs:
+            raise HTTPException(400, "Диалоги с такими id не найдены")
     if only_missing:
         convs = [c for c in convs if not c["evaluated"]]
         if not convs:

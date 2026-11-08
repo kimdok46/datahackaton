@@ -22,7 +22,7 @@ uvicorn backend.main:app --reload
 
 ## Стек
 
-Python, FastAPI, SQLite; фронтенд на чистом HTML/JS. ИИ: Gemini, Mistral, Groq, Anthropic через запасную цепочку (используется провайдер, для которого указан ключ).
+Python, FastAPI, SQLite; фронтенд на чистом HTML/JS. ИИ подключается по OpenAI-совместимому API через запасную цепочку: используется провайдер, для которого указан ключ в `.env` (DeepSeek, Gemini, Groq). Основная модель оценки: `deepseek-flash` (DeepSeek, внешний API, `mode: external_api`). Часть DEV-оценок получена через `gemini-flash-latest`.
 
 ## Архитектура
 
@@ -31,6 +31,7 @@ Python, FastAPI, SQLite; фронтенд на чистом HTML/JS. ИИ: Gemin
 - `backend/scoring.py`: подсчёт итога, секций, N/A, грубых ошибок
 - `backend/db.py`: SQLite (диалоги, версии чек-листа, оценки, апелляции)
 - `frontend/`: интерфейс (`index.html`, `appeals.js`, `checklist-editor.js`)
+- `scripts/export_results.py`: выгрузка оценок в `results/<dev|prod>/results.json` (формат JSON 1.0)
 - `docs/api.md`: описание API
 
 ## Команда и роли
@@ -38,8 +39,32 @@ Python, FastAPI, SQLite; фронтенд на чистом HTML/JS. ИИ: Gemin
 Баймурзаева Мерей - Backend
 Бекболат Жаннур - Оценка ИИ
 Мирас Әбіләшім - Frontend
+Айғаным Қабдыләшім - апелляции, чек-лист, демо
 
 
 ## Стоимость одной оценки
 
-(вписать: модель, число токенов на диалог, цена. Токены сохраняются в оценке: `usage.input_tokens` и `usage.output_tokens`.)
+Модель: `deepseek-flash` (внешний API DeepSeek). Один диалог оценивается одним вызовом модели (при ошибке формата код делает до 3 попыток, их токены уже учтены в среднем).
+
+Замер по 65 диалогам DEV (токены сохраняются в оценке: `usage.input_tokens`, `usage.output_tokens`):
+
+- в среднем 2329 входных и 1834 выходных токена на диалог;
+- цены DeepSeek за 1 млн токенов: вход $0.15 / выход $0.60 (непиковое время) и $0.30 / $1.20 (пиковое), по данным api-docs.deepseek.com на ноябрь 2026;
+- **≈ $0.0015 за оценку в непиковое время, ≈ $0.0029 в пиковое** (примерно 0.15-0.3 цента);
+- вся DEV-выборка (65 диалогов): ≈ $0.09-0.19; контрольный набор (10 диалогов): ≈ $0.015-0.03.
+
+Цены провайдера меняются, актуальные значения: https://api-docs.deepseek.com/quick_start/pricing
+
+## Сдача результатов
+
+```bash
+# DEV
+python3 scripts/export_results.py --group dev --team "WandaVision"
+
+# PROD (контрольный набор): загрузить по ссылке организаторов, оценить, выгрузить
+curl -X POST "http://127.0.0.1:8000/api/import" -H "Content-Type: application/json" -d '{"url":"ССЫЛКА_ОРГАНИЗАТОРОВ"}'
+curl -X POST "http://127.0.0.1:8000/api/evaluate-all?only_missing=true"
+python3 scripts/export_results.py --group prod --team "WandaVision" --source data/prod.json
+```
+
+Скрипт проверяет результат (все 8 критериев, допустимые значения и N/A, отсутствие дублей ID, совпадение ID с набором). Диалоги без оценки попадают в файл как `status: "error"`.

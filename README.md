@@ -1,19 +1,45 @@
-# CQA, оценка качества диалогов (Freedom Broker Hackathon)
+# CQA: оценка качества диалогов (Freedom Broker Hackathon)
+
+Веб-приложение: ИИ оценивает диалоги операторов по чек-листу, итог считает код, а не модель. Есть апелляции с экраном проверяющего и редактор чек-листа.
 
 ## Запуск
-### Backend (FastAPI)
-1. cd backend
-2. python -m venv .venv && source .venv/bin/activate
-3. pip install -r requirements.txt
-4. cp .env.example .env   # вписать FLOW_URL и ключи ИИ
-5. uvicorn main:app --reload   # проверка: http://localhost:8000/health
 
-### Загрузка датасета
-python scripts/load_dataset.py --group_id DEV
+```bash
+pip install -r backend/requirements.txt
+cp .env.example .env        # вписать ключи ИИ (достаточно одного)
+uvicorn backend.main:app --reload
+```
 
-### Frontend
-Открыть frontend/index.html (или npx serve frontend)
+Открыть http://localhost:8000 (проверка сервера: http://localhost:8000/health).
+
+Команды запускать из корня репозитория. При первом запуске чек-лист и диалоги DEV загружаются автоматически из `data/`.
+
+## Как пользоваться
+
+1. Выбрать диалог в списке, нажать «Оценить с помощью ИИ».
+2. «Оспорить» у критерия: отправить апелляцию. Вкладка «⚖ Проверяющий»: подтвердить или изменить оценку с причиной.
+3. Вкладка «✓ Чек-лист»: изменить критерии, «Сохранить», затем «Применить к диалогам» (пересчёт оценок в фоне, можно указать ID диалогов).
+
+## Стек
+
+Python, FastAPI, SQLite; фронтенд на чистом HTML/JS. ИИ: Gemini, Mistral, Groq, Anthropic через запасную цепочку (используется провайдер, для которого указан ключ).
+
+## Архитектура
+
+- `backend/main.py`: API
+- `backend/ai.py`: промпт из чек-листа, вызов модели, проверка цитат
+- `backend/scoring.py`: подсчёт итога, секций, N/A, грубых ошибок
+- `backend/db.py`: SQLite (диалоги, версии чек-листа, оценки, апелляции)
+- `frontend/`: интерфейс (`index.html`, `appeals.js`, `checklist-editor.js`)
+- `docs/api.md`: описание API
 
 ## Команда и роли
-## Архитектура
-## Стоимость одной оценки (модель, цена, число вызовов)
+
+Баймурзаева Мерей - Backend
+Бекболат Жаннур - Оценка ИИ
+Мирас Әбіләшім - Frontend
+
+
+## Стоимость одной оценки
+
+(вписать: модель, число токенов на диалог, цена. Токены сохраняются в оценке: `usage.input_tokens` и `usage.output_tokens`.)

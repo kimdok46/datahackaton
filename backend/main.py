@@ -1,9 +1,15 @@
 import json
 from pathlib import Path
 
+import html
+import re
+
+import requests
 from fastapi import Body, FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+import threading
 import time
 
 from backend import ai, db, scoring
@@ -57,6 +63,61 @@ def conversation(conv_id: str):
         "evaluation": db.get_evaluation(conv_id),
     }
 
+AUDIO_DIR = ROOT / "audio_cache"
+
+
+def _sniff_audio(head, header_type):
+    if header_type.startswith("audio/"):
+        return header_type
+    if head[:4] == b"RIFF":
+        return "audio/wav"
+    if head[:3] == b"ID3" or head[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "audio/mpeg"
+    if head[:4] == b"OggS":
+        return "audio/ogg"
+    if head[4:8] == b"ftyp":
+        return "audio/mp4"
+    if head[:4] == b"fLaC":
+        return "audio/flac"
+    if head[:4] == b"\x1aE\xdf\xa3":
+        return "audio/webm"
+    return None
+
+
+def _download(url):
+    try:
+        r = requests.get(url, timeout=60)
+    except requests.RequestException as e:
+        raise HTTPException(502, f"Не удалось скачать запись: {e}")
+    if r.status_code != 200:
+        raise HTTPException(502, f"Сервер записи ответил кодом {r.status_code}")
+    return r, r.headers.get("Content-Type", "").split(";")[0].strip().lower()
+
+
+@app.get("/api/audio/{conv_id}")
+def audio(conv_id: str):
+    """Запись звонка: скачиваем один раз и отдаём со своего сервера.
+    audio_url ведёт на HTML-страницу плеера, настоящий файл лежит в её теге <source>."""
+    conv = db.get_conversation(conv_id)
+    if conv is None or not conv.get("audio_url"):
+        raise HTTPException(404, "У диалога нет записи")
+    safe = "".join(ch for ch in conv_id if ch.isalnum() or ch in "-_")
+    f, meta = AUDIO_DIR / safe, AUDIO_DIR / (safe + ".type")
+    if not (f.exists() and meta.exists()):
+        r, header_type = _download(conv["audio_url"])
+        if header_type == "text/html":
+            m = re.search(r'<source[^>]+src="([^"]+)"', r.text)
+            if not m:
+                raise HTTPException(502, "На странице записи не найден аудиофайл")
+            r, header_type = _download(html.unescape(m.group(1)))
+        ctype = _sniff_audio(r.content[:12], header_type)
+        if ctype is None:
+            raise HTTPException(502, f"Ответ не похож на аудио: {header_type}, {r.content[:12]!r}")
+        AUDIO_DIR.mkdir(exist_ok=True)
+        f.write_bytes(r.content)
+        meta.write_text(ctype)
+    return FileResponse(f, media_type=meta.read_text())
+
 
 @app.get("/api/checklist")
 def get_checklist():
@@ -65,14 +126,37 @@ def get_checklist():
 
 @app.put("/api/checklist")
 def put_checklist(data: dict = Body(...)):
-    if not isinstance(data.get("criteria"), list) or not data["criteria"]:
+    crits = data.get("criteria")
+    if not isinstance(crits, list) or not crits:
         raise HTTPException(400, "В чек-листе должен быть список criteria")
-    for c in data["criteria"]:
-        if not c.get("id") or not c.get("name"):
+    seen, weight_sum = set(), 0.0
+    for c in crits:
+        if not isinstance(c, dict) or not c.get("id") or not c.get("name"):
             raise HTTPException(400, "У каждого критерия должны быть id и name")
-        if c.get("weight", 0) < 0:
-            raise HTTPException(400, f"Вес критерия {c['id']} не может быть отрицательным")
+        if c["id"] in seen:
+            raise HTTPException(400, f"Повторяется id критерия: {c['id']}")
+        seen.add(c["id"])
+        if c.get("type") not in ("yes_no", "scale", "flag"):
+            raise HTTPException(400, f"Критерий {c['id']}: тип должен быть yes_no, scale или flag")
+        w = c.get("weight", 0)
+        if isinstance(w, bool) or not isinstance(w, (int, float)) or w < 0:
+            raise HTTPException(400, f"Вес критерия {c['id']} должен быть числом не меньше 0")
+        if c["type"] == "scale":
+            steps = c.get("scale")
+            if (not isinstance(steps, list) or not steps
+                    or any(not isinstance(s, dict) or isinstance(s.get("value"), bool)
+                           or not isinstance(s.get("value"), (int, float)) for s in steps)):
+                raise HTTPException(400, f"Критерий {c['id']}: нужна шкала со ступенями (value, label)")
+            if max(s["value"] for s in steps) <= 0:
+                raise HTTPException(400, f"Критерий {c['id']}: максимальная ступень шкалы должна быть больше 0")
+        if c["type"] != "flag":
+            if not c.get("section"):
+                raise HTTPException(400, f"Критерий {c['id']}: не указана секция")
+            weight_sum += w
+    if weight_sum <= 0:
+        raise HTTPException(400, "Сумма весов критериев должна быть больше 0")
     return {"version": db.save_checklist(data)}
+
 
 def evaluate_and_save(conv_id):
     conv = db.get_conversation(conv_id)
@@ -95,19 +179,74 @@ def evaluate_one(conv_id: str):
         raise HTTPException(502, str(e))
 
 
-@app.post("/api/evaluate-all")
-def evaluate_all():
-    ok, failed = 0, []
-    for c in db.list_conversations():
-        try:
-            evaluate_and_save(c["id"])
-            ok += 1
-        except Exception as e:
-            failed.append({"id": c["id"], "error": str(e)})
+_job = {"running": False, "total": 0, "done": 0, "failed": []}
+_job_lock = threading.Lock()
+
+
+def _run_job(ids):
+    limit_hits = 0  # подряд идущие диалоги, упавшие из-за лимита запросов (429)
+    for conv_id in ids:
+        failed_429 = False
+        for attempt in range(3):
+            try:
+                evaluate_and_save(conv_id)
+                limit_hits = 0
+                break
+            except Exception as e:
+                msg = str(getattr(e, "detail", None) or e)
+                if "429" in msg and attempt < 2:
+                    time.sleep(65)  # лимит запросов в минуту: ждём и повторяем
+                    continue
+                _job["failed"].append({"id": conv_id, "error": msg[:200]})
+                failed_429 = "429" in msg
+                break
+        _job["done"] += 1
+        if failed_429:
+            limit_hits += 1
+            if limit_hits >= 2:
+                _job["failed"].append({"id": "-", "error": "Лимит API исчерпан, оценка остановлена. Добавьте ключи Mistral/Groq в .env или подождите."})
+                break
         time.sleep(1)  # пауза, чтобы не упереться в лимит запросов в минуту
-    return {"evaluated": ok, "failed": failed}
-    
-# Раздача страницы. Эта строка должна быть ПОСЛЕДНЕЙ в файле.
+    _job["running"] = False
+
+
+def _start_job(ids):
+    with _job_lock:
+        if _job["running"]:
+            raise HTTPException(409, "Оценка уже идёт, дождитесь окончания")
+        _job.update(running=True, total=len(ids), done=0, failed=[])
+    threading.Thread(target=_run_job, args=(ids,), daemon=True).start()
+    return {"started": len(ids)}
+
+
+@app.post("/api/evaluate-all")
+def evaluate_all(only_missing: bool = False):
+    convs = db.list_conversations()
+    if only_missing:
+        convs = [c for c in convs if not c["evaluated"]]
+        if not convs:
+            raise HTTPException(400, "Все диалоги уже оценены")
+    return _start_job([c["id"] for c in convs])
+
+
+@app.post("/api/checklist/apply")
+def apply_checklist(data: dict | None = Body(None)):
+    all_ids = [c["id"] for c in db.list_conversations()]
+    ids = (data or {}).get("ids")
+    if ids:
+        ids = [i for i in ids if i in all_ids]
+        if not ids:
+            raise HTTPException(400, "Диалоги с такими id не найдены")
+    else:
+        ids = all_ids
+    return {**_start_job(ids), "checklist_version": db.get_checklist()["version"]}
+
+
+@app.get("/api/evaluate-status")
+def evaluate_status():
+    return {"running": _job["running"], "total": _job["total"],
+            "done": _job["done"], "failed": list(_job["failed"])}
+
 
 def _criterion(checklist, cid):
     return next((c for c in checklist["criteria"] if c["id"] == cid), None)
@@ -185,7 +324,13 @@ def get_appeals(conversation_id: str | None = None):
     items = db.list_appeals()
     if conversation_id:
         items = [a for a in items if a["conversation_id"] == conversation_id]
-    return [_appeal_view(a) for a in items]
+    out = []
+    for a in items:
+        try:
+            out.append(_appeal_view(a))
+        except (StopIteration, TypeError, KeyError):
+            continue  # оценку или критерий пересоздали при применении чек-листа
+    return out
 
 
 @app.post("/api/appeals/{appeal_id}/decision")
@@ -231,4 +376,6 @@ def decide_appeal(appeal_id: int, data: dict = Body(...)):
                      decision, new_value, reason)
     return _appeal_view(db.get_appeal(appeal_id))
 
+
+# Раздача страницы. Эта строка должна быть ПОСЛЕДНЕЙ в файле.
 app.mount("/", StaticFiles(directory=ROOT / "frontend", html=True), name="frontend")

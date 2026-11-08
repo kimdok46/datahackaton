@@ -28,12 +28,10 @@ PROVIDER_SPECS = [
     # name, ключ, base_url, переменная модели, модель по умолчанию, поддержка json-режима
     ("gemini", "GEMINI_API_KEY", "https://generativelanguage.googleapis.com/v1beta/openai/",
      "GEMINI_MODEL", "gemini-flash-latest", True),
-    ("mistral", "MISTRAL_API_KEY", "https://api.mistral.ai/v1",
-     "MISTRAL_MODEL", "mistral-small-latest", True),
     ("groq", "GROQ_API_KEY", "https://api.groq.com/openai/v1",
      "GROQ_MODEL", "llama-3.3-70b-versatile", True),
-    ("anthropic", "ANTHROPIC_API_KEY", "https://api.anthropic.com/v1/",
-     "ANTHROPIC_MODEL", "claude-haiku-5-5", False),
+    ("deepseek", "DEEPSEEK_API_KEY", "https://api.deepseek.com",
+     "DEEPSEEK_MODEL", "deepseek-flash", True),
 ]
 
 

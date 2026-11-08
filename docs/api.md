@@ -6,13 +6,14 @@
 - GET  /api/conversations                  список (id, язык, канал, итог, есть ли оценка)
 - GET  /api/conversations/{id}             транскрипт + оценка (если есть)
 - POST /api/conversations/{id}/evaluate    запустить оценку одного диалога
-- POST /api/evaluate-all                   оценить все диалоги
+- POST /api/evaluate-all                   оценить все диалоги в фоне (сразу возвращает {started})
+- GET  /api/evaluate-status                прогресс фоновой оценки {running, total, done, failed}
 - POST /api/import?group_id=DEV            загрузить набор организаторов в базу
 
 ## Чек-лист
 - GET  /api/checklist                      текущая версия
 - PUT  /api/checklist                      сохранить (создаёт новую версию)
-- POST /api/checklist/apply                пересчитать оценки по текущей версии
+- POST /api/checklist/apply                пересчитать оценки по текущей версии в фоне; тело необязательно: {"ids": ["p1-ru-001"]}
 
 ## Апелляции
 - POST /api/appeals                        {conversation_id, criterion_id, comment}

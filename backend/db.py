@@ -185,3 +185,8 @@ def decide_appeal(appeal_id, status, decision, new_value, reason):
                WHERE id = ?""",
             (status, decision, None if new_value is None else str(new_value), reason, now(), appeal_id),
         )
+
+def get_checklist_version(version):
+    with conn() as c:
+        row = c.execute("SELECT data_json FROM checklists WHERE version = ?", (version,)).fetchone()
+    return json.loads(row["data_json"]) if row else None
